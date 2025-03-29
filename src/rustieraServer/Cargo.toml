@@ -2,13 +2,15 @@
 name = "rustieraServer"
 version = "0.1.0"
 edition = "2024"
-
 [dependencies]
 quiche = "*"
-log = "*"
+log = {version = "*",features = ["kv"]}
 env_logger="*"
-backtrace = "*"
 tokio = { version = "*",features = ["full"] }
-mio = { version = "*", features = ["os-poll","net"] }
+#mio = { version = "*", features = ["os-poll","net"] }
 ring = "0.16.20"
 libRustiera = { path = "../libRustiera" }
+tokio-quiche="0.2.2"
+futures = "0.3.31"
+mio = "1.0.3"
+bytes = "1.10.1"
