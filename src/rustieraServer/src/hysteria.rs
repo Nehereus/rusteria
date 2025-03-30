@@ -1,26 +1,22 @@
-use crate::stream::{ReceivedH3Stream, StreamReady, WaitForStream};
+use crate::stream::{ReceivedH3Stream, StreamReady, WaitForH3Stream, WaitForStream};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::channel::mpsc::Sender;
 use futures::stream::FuturesUnordered;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use std::collections::BTreeMap;
 use std::io;
-use std::task::{Context, Poll};
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::TryRecvError;
-use tokio::task::{JoinHandle, spawn};
+use tokio::task::JoinHandle;
 use tokio::{runtime, select};
 use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::buffer_pool::PooledBuf;
-use tokio_quiche::datagram_socket::DatagramSocketRecv;
-use tokio_quiche::http3::driver::{H3Event, OutboundFrame};
+use tokio_quiche::http3::driver::OutboundFrame;
 use tokio_quiche::quic::{HandshakeInfo, QuicheConnection};
-use tokio_quiche::{ApplicationOverQuic, QuicConnection, QuicResult, ServerH3Driver};
+use tokio_quiche::{ApplicationOverQuic, QuicResult};
 
 struct TCPProxyManager {
     //in case needs of reconnection
@@ -53,7 +49,7 @@ pub struct H3Response {
 }
 #[derive(Debug)]
 pub enum HysEvent {
-    H3Event(u64, quiche::h3::Event, oneshot::Sender<H3Response>),
+    H3Event(u64, quiche::h3::Event, mpsc::Sender<H3Response>),
     QuicEvent(u64, Bytes, Sender<Bytes>),
 }
 
@@ -81,7 +77,7 @@ pub struct HysDriver {
     tcp_proxy_map: BTreeMap<u64, TCPProxyManager>,
 }
 struct H3Context {
-    receiver: Option<oneshot::Receiver<H3Response>>,
+    receiver: Option< tokio::sync::mpsc::Receiver<H3Response>>,
     queued_frames: Vec<H3Response>,
 }
 impl HysDriver {
@@ -126,13 +122,13 @@ impl HysDriver {
             chan,
             response,
         } = h3_ready;
-
         match self.h3_context_map.get_mut(&stream_id) {
             None => Ok(()),
             Some(stream) => {
                 // Get the response data before processing
-                
-                stream.queued_frames.push(response.unwrap());
+                if let Some(response) = response {
+                    stream.queued_frames.push(response);
+                }
                 stream.receiver = None;
                 Ok(())
             }
@@ -310,22 +306,24 @@ impl ApplicationOverQuic for HysDriver {
     }
 
     fn should_act(&self) -> bool {
-        info!("should act");
         self.h3conn.is_some() || self.is_verified
     }
 
     fn buffer(&mut self) -> &mut [u8] {
-        info!("{} buffer", self.buffer.len());
+        trace!("left {} bytes buffer", self.buffer.len());
         &mut self.buffer
     }
 
     async fn wait_for_data(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         debug!("{} wait for data", qconn.trace_id());
+
         select! {
             Some(ready) = self.waiting_streams.next() => self.upstream_ready(qconn, ready).unwrap(),
-        }
+             _ = tokio::time::sleep(Duration::from_millis(5000)) => { println!("outer timeout"); }
+    };
+
         Ok(())
-        }
+    }
 
         fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         debug!("{} process reads", qconn.trace_id());
@@ -333,7 +331,7 @@ impl ApplicationOverQuic for HysDriver {
             assert!(self.h3conn.is_some());
             if !self.is_verified {
                 if let Ok((stream_id, event)) = self.h3conn_as_mut().poll(qconn) {
-                    let (tx, rx) = oneshot::channel();
+                    let (tx, rx) = mpsc::channel(65535);
                     self.h3_context_map.insert(
                         stream_id,
                         H3Context {
@@ -341,9 +339,17 @@ impl ApplicationOverQuic for HysDriver {
                             queued_frames: vec![],
                         },
                     );
+                    self.waiting_streams.push(WaitForStream::H3Stream(
+                        WaitForH3Stream{
+                            stream_id,
+                            chan: self.h3_context_map.get_mut(&stream_id).unwrap().receiver.take(),
+                        }));
+
                     self.event_sender
                         .send(HysEvent::H3Event(stream_id, event, tx))
                         .expect("sending failed");
+
+
                 } else {
                     warn!("{} h3conn poll failed", qconn.trace_id());
                 }
@@ -356,28 +362,27 @@ impl ApplicationOverQuic for HysDriver {
     }
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        debug!("{} process writes", qconn.trace_id());
         for stream_id in qconn.writable() {
             debug!("stream {} writable", stream_id);
-            if self.h3_context_map.get(&stream_id).is_some() {
-                warn!("waiting for h3 response");
-                match self
-                    .h3_context_map
-                    .get_mut(&stream_id)
-                    .unwrap()
-                    .receiver
-                    .as_mut()
-                    .unwrap()
-                    .try_recv()
-                {
-                    Ok(h3_response) => {
-                        self.h3_context_map
-                            .get_mut(&stream_id)
-                            .unwrap()
-                            .queued_frames
-                            .push(h3_response);
+            if let Some(context) = self.h3_context_map.get_mut(&stream_id) {
+                if let Some(receiver) = context.receiver.as_mut() {
+                    match receiver.try_recv() {
+                        Ok(h3_response) => {
+                            warn!("quiche received the message");
+                            // Successfully received, add to queued frames
+                            context.queued_frames.push(h3_response);
+                            // Set receiver to None since it's been consumed
+                            context.receiver = None;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            self.waiting_streams.push(WaitForStream::H3Stream(
+                                WaitForH3Stream{
+                                    stream_id,
+                                    chan: self.h3_context_map.get_mut(&stream_id).unwrap().receiver.take(),
+                                }));
+                        }
+                        other => info!("H3 response error: {:?}", other),
                     }
-                    other => info!("other h3 response: {:?}", other),
                 }
             } else if !self.is_verified {
                 debug!("new unverified stream id: {}", stream_id);

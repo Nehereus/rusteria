@@ -1,10 +1,6 @@
-use crate::structs::{Client, PartialResponse};
 use libRustiera::proto::*;
-use log::{error, info, warn};
 use quiche::h3::Header;
-use quiche::h3::NameValue;
-use tokio_quiche::buf_factory::{BufFactory, PooledBuf};
-use tokio_quiche::buffer_pool::Pooled;
+use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::http3::driver::OutboundFrame;
 
 //TODO: auth should always return a response regardless of the auth result;

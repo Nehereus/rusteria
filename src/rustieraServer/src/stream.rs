@@ -2,9 +2,9 @@ use crate::hysteria::H3Response;
 use bytes::Bytes;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use log::error;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::TryRecvError;
+use tokio_quiche::datagram_socket::DatagramSocketRecv;
 
 pub enum WaitForStream {
     H3Stream(WaitForH3Stream),
@@ -15,8 +15,8 @@ pub enum StreamReady {
     QuicStream(ReceivedQuicStream),
 }
 pub struct WaitForH3Stream {
-    stream_id: u64,
-    chan: Option<oneshot::Receiver<H3Response>>,
+    pub(crate) stream_id: u64,
+    pub(crate) chan: Option<Receiver<H3Response>>,
 }
 pub struct WaitForQuicStream {
     stream_id: u64,
@@ -25,7 +25,7 @@ pub struct WaitForQuicStream {
 
 pub struct ReceivedH3Stream {
     pub stream_id: u64,
-    pub chan: oneshot::Receiver<H3Response>,
+    pub chan: Receiver<H3Response>,
     pub response: Option<H3Response>,
 }
 
@@ -37,24 +37,16 @@ pub struct ReceivedQuicStream {
 
 impl Future for WaitForH3Stream {
     type Output = ReceivedH3Stream;
+
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.chan.as_mut().unwrap().try_recv() {
-            Ok(data) => Poll::Ready(ReceivedH3Stream {
+        error!("{}",self.chan.as_mut().unwrap().is_closed());
+        self.chan.as_mut().unwrap().poll_recv(cx).map(|data| {
+            ReceivedH3Stream {
                 stream_id: self.stream_id,
                 chan: self.chan.take().unwrap(),
-                response: Some(data),
-            }),
-            Err(TryRecvError::Empty) => {
-                // Register waker to be notified when data arrives
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                response: data,
             }
-            Err(TryRecvError::Closed) => Poll::Ready(ReceivedH3Stream {
-                stream_id: self.stream_id,
-                chan: self.chan.take().unwrap(),
-                response: None,
-            }),
-        }
+        })
     }
 }
 

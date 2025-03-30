@@ -168,7 +168,7 @@ impl<'a> AuthRequest<'a> {
                 Ok(s) => {
                     debug!("Received unknown header: {}", s);
                 }
-                Err(e) => error!("Failed to parse the header: {}", e),
+                Err(e) => warn!("Failed to parse the header: {}", e),
             }
         }
 
@@ -180,7 +180,7 @@ impl<'a> AuthRequest<'a> {
                 padding,
             })
         } else {
-            error!("Incomplete auth headers");
+            warn!("Incomplete auth headers");
             Err("Incomplete auth headers")
         }
     }

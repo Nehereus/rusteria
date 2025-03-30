@@ -1,23 +1,16 @@
 use crate::auth;
-use crate::auth::auth;
 use crate::handler::stream_handler;
 use crate::hysteria::{H3Response, HysController, HysDriver, HysEvent};
 use env_logger;
-use futures::SinkExt;
 use futures::stream::StreamExt;
-use log::{debug, error, info, warn};
-use quiche::{Connection, h3};
+use log::{debug, info, warn};
+use quiche::h3;
 use std::collections::BTreeMap;
-use tokio::net::{TcpStream, UdpSocket};
 use tokio::runtime::Handle;
-use tokio_quiche::ServerH3Driver;
-use tokio_quiche::buf_factory::BufFactory;
-use tokio_quiche::http3::driver::{H3Event, IncomingH3Headers, OutboundFrame, ServerH3Event};
-use tokio_quiche::http3::settings::Http3Settings;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::ConnectionParams;
-use tokio_quiche::{ServerH3Controller, listen};
+use tokio_quiche::listen;
 
 const HOSTNAME: &str = "0.0.0.0";
 const LISTEN_PORT: u16 = 8888;
@@ -56,7 +49,7 @@ async fn server() {
     }
 }
 async fn handle_connection(mut controller: HysController, handle: Handle) {
-    let mut stream_map: BTreeMap<u64, stream_handler> = BTreeMap::new();
+    let stream_map: BTreeMap<u64, stream_handler> = BTreeMap::new();
     let mut verified: bool = false;
     while let Some(event) = controller.event_receiver_mut().recv().await {
         debug!("event received:{:?}", event);
@@ -71,9 +64,7 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
                             let (auth_res, response) = auth::auth(list);
                             verified = auth_res;
                             //ignore sending error for now
-                            sender
-                                .send(H3Response { auth_res, response })
-                                .expect("sending failed");
+                            sender.send(H3Response { auth_res, response }).await.unwrap();
                         }
                         h3::Event::Finished => {
                             //self.h3_outbound_map.remove(&stream_id);
