@@ -1,14 +1,12 @@
-use bytes::buf::Reader;
 use bytes::{Buf, Bytes, BytesMut};
 use std::io;
-use std::io::{Error, Read};
+use std::io::Read;
 use std::sync::mpsc::SendError;
-use log::{error, info, warn};
+use log::{error, info};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tokio::{runtime, select};
+use tokio::select;
 
 pub struct ProxyManager {
     //in case needs of reconnection

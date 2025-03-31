@@ -1,5 +1,4 @@
 use crate::auth;
-use crate::handler::stream_handler;
 use crate::hysteria::{H3Response, HysController, HysDriver, HysEvent, ProxyEvent};
 use crate::proxy::ProxyManager;
 use env_logger;
@@ -9,12 +8,11 @@ use quiche::h3;
 use std::collections::BTreeMap;
 use bytes::Bytes;
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio_quiche::{listen, QuicResult};
+use tokio::sync::mpsc::Sender;
+use tokio_quiche::listen;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::ConnectionParams;
-use quiche::Config;
 use libRustiera::proto::{HysteriaTCPResponse, HysteriaTCPResponseStatus};
 
 const HOSTNAME: &str = "0.0.0.0";
@@ -110,7 +108,7 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
                     }
                     ProxyEvent::Payload(payload) => {
                         info!("Received proxy payload for stream id: {}", stream_id);
-                        if(proxy_map.contains_key(&stream_id)){
+                        if proxy_map.contains_key(&stream_id) {
                             proxy_map
                                 .get_mut(&stream_id)
                                 .unwrap()
