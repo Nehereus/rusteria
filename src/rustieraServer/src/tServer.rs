@@ -78,8 +78,11 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
                 } else {
                     warn!("Verified user is sending h3 request again");
                 }
+                drop(sender); 
             }
-            HysEvent::QuicEvent(stream_id, bytes, sender) => {}
+            HysEvent::QuicEvent(stream_id, bytes, sender) => {
+                warn!("handle quic event");
+            }
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::stream::{ReceivedH3Stream, StreamReady, WaitForH3Stream, WaitForStream};
+use crate::stream::{ReceivedH3Stream, StreamReady, WaitForH3Stream, WaitForQuicStream, WaitForStream};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::channel::mpsc::Sender;
@@ -7,6 +7,7 @@ use log::{debug, error, info, trace, warn};
 use std::collections::BTreeMap;
 use std::io;
 use std::time::Duration;
+use quiche::{Connection, Shutdown};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -17,31 +18,9 @@ use tokio_quiche::buffer_pool::PooledBuf;
 use tokio_quiche::http3::driver::OutboundFrame;
 use tokio_quiche::quic::{HandshakeInfo, QuicheConnection};
 use tokio_quiche::{ApplicationOverQuic, QuicResult};
+use libRustiera::proto::{HysteriaTCPResponse, HysteriaTCPResponseStatus, HysteriaTcpRequest};
 
-struct TCPProxyManager {
-    //in case needs of reconnection
-    connection_handle: Option<JoinHandle<Result<TcpStream, io::Error>>>,
-    stream: Option<TcpStream>,
-    client_outbound_buffer: BytesMut,
-    server_outbound_buffer: BytesMut,
-    client_outbound_handle: Option<tokio::task::JoinHandle<()>>,
-    server_outbound_handle: Option<tokio::task::JoinHandle<()>>,
-    runtime: Runtime,
-}
-impl TCPProxyManager {
-    pub fn new(server_addr: String) -> Self {
-        let connection_handle = tokio::spawn(TcpStream::connect(server_addr.clone()));
-        Self {
-            connection_handle: Some(connection_handle),
-            stream: None,
-            client_outbound_buffer: BytesMut::with_capacity(65535),
-            server_outbound_buffer: BytesMut::with_capacity(65535),
-            client_outbound_handle: None,
-            server_outbound_handle: None,
-            runtime: runtime::Builder::new_current_thread().build().unwrap(),
-        }
-    }
-}
+
 #[derive(Debug)]
 pub struct H3Response {
     pub(crate) auth_res: bool,
@@ -50,7 +29,13 @@ pub struct H3Response {
 #[derive(Debug)]
 pub enum HysEvent {
     H3Event(u64, quiche::h3::Event, mpsc::Sender<H3Response>),
-    QuicEvent(u64, Bytes, Sender<Bytes>),
+    QuicEvent(u64, ProxyEvent, mpsc::Sender<Bytes>),
+}
+#[derive(Debug)]
+pub enum ProxyEvent{
+    //url
+    Request(String),
+    Payload(Bytes),
 }
 
 pub struct HysController {
@@ -73,12 +58,14 @@ pub struct HysDriver {
     h3config: quiche::h3::Config,
     event_sender: mpsc::UnboundedSender<HysEvent>,
     h3_context_map: BTreeMap<u64, H3Context>,
-    //TODO add QUIC context
-    tcp_proxy_map: BTreeMap<u64, TCPProxyManager>,
+    quic_context_map: BTreeMap<u64, QuicContext>,
 }
 struct H3Context {
-    receiver: Option< tokio::sync::mpsc::Receiver<H3Response>>,
     queued_frames: Vec<H3Response>,
+}
+struct QuicContext {
+    //TODO undetermined implementation
+    queued_bytes: BytesMut,
 }
 impl HysDriver {
     pub fn new() -> (Self, HysController) {
@@ -92,7 +79,7 @@ impl HysDriver {
                 h3config: quiche::h3::Config::new().unwrap(),
                 event_sender,
                 h3_context_map: BTreeMap::new(),
-                tcp_proxy_map: BTreeMap::new(),
+                quic_context_map: BTreeMap::new(),
             },
             HysController {
                 event_receiver: Some(event_receiver),
@@ -129,162 +116,210 @@ impl HysDriver {
                 if let Some(response) = response {
                     stream.queued_frames.push(response);
                 }
-                stream.receiver = None;
                 Ok(())
             }
         }
     }
-    fn process_h3_response(
+
+    //process the queued frames and return unprocessed ones if any
+    fn handle_h3_response(
         &mut self,
         qconn: &mut QuicheConnection,
         stream_id: u64,
         responses: &H3Response,
-    ) {
-        //TODO
-    }
-}
-
-#[cfg(not_compile)]
-fn handle_h3_write(&mut self, qconn: &mut quiche::Connection, stream_id: u64) -> QuicResult<()> {
-    if self.h3_context_map.contains_key(&stream_id) {
-        warn!(
-            "connection status: {},is established: {}",
-            qconn.is_closed(),
-            qconn.is_established()
-        );
-
-        while let Some(frame) = self.h3_context_map.get_mut(&stream_id).unwrap().last_mut() {
-            let res: quiche::h3::Result<()> = match frame {
+    ) -> Result<Vec<OutboundFrame>, quiche::h3::Error> {
+        self.is_verified |= responses.auth_res;
+        let mut sending_results: Vec<Option<OutboundFrame>> = vec![];
+        for frame in responses.response.iter() {
+            sending_results.push(match frame {
                 OutboundFrame::Headers(h) => {
                     debug!("{} send headers", qconn.trace_id());
-                    self.h3conn
-                        .as_mut()
-                        .unwrap()
-                        .send_response(qconn, stream_id, h.as_ref(), false)
+                    if self.h3conn_as_mut().send_response(qconn, stream_id, h.as_ref(), false).is_err() {
+                        Some(OutboundFrame::Headers((*h.clone()).to_owned()))
+                    } else {
+                        None
+                    }
                 }
+
                 OutboundFrame::Body(body, fin) => {
                     debug!("{} send body on stream: {}", qconn.trace_id(), stream_id);
                     match self
-                        .h3conn
-                        .as_mut()
-                        .unwrap()
-                        .send_body(qconn, stream_id, body, *fin)
+                        .h3conn_as_mut()
+                        .send_body(qconn, stream_id, &body, *fin)
                     {
                         Ok(n) => {
                             if n == body.len() {
-                                Ok(())
+                                None
                             } else {
                                 let (_, new_body) = body.split_at(n);
-                                *body = BufFactory::buf_from_slice(new_body);
-                                Err(quiche::h3::Error::Done)
+                                //re-push the remaining body back to the queue
+                                //this works because we will .pop to traverse the queue,
+                                //instead of referencing part of the queue,
+                                //we extract the frame out of the queue then reference it
+                                Some(OutboundFrame::Body(
+                                    BufFactory::buf_from_slice(new_body),
+                                    *fin,
+                                ))
                             }
                         }
                         Err(e) => {
                             error!("{} send body error: {}", qconn.trace_id(), e);
-                            Err(e)
+                            Some(OutboundFrame::Body(
+                                BufFactory::buf_from_slice(body),
+                                *fin,
+                            ))
                         }
                     }
                 }
                 _ => {
                     warn!("{} unknown frame type: {:?}", qconn.trace_id(), frame);
-                    Ok(())
+                    None
                 }
-            };
-            if res.is_ok() {
-                self.h3_context_map.get_mut(&stream_id).unwrap().pop();
-            } else {
-                break;
-            }
+            });
         }
+        //TODO collect the sending errors
+        Ok(vec![])
     }
-    Ok(())
-}
-#[cfg(not_compile)]
-fn handle_quic_read(&mut self, qconn: &mut Connection) -> QuicResult<()> {
-    for stream_id in qconn.readable() {
-        let mut read_buf: [u8; 65535] = [0; 65535];
-        let mut offset = 0;
-        while qconn.stream_readable(stream_id) {
-            let (read, fin) = qconn.stream_recv(stream_id, &mut read_buf[offset..])?;
-            offset += read;
-        }
-        info!(
+
+    // #[cfg(not_compile)]
+    // should send one of the HysEvent to the receiver
+    fn handle_quic_request(&mut self, qconn: &mut Connection) -> QuicResult<()> {
+        for stream_id in qconn.readable() {
+            let mut read_buf: [u8; 65535] = [0; 65535];
+            let mut offset = 0;
+            while qconn.stream_readable(stream_id) {
+                let (read, fin) = qconn.stream_recv(stream_id, &mut read_buf[offset..])?;
+                offset += read;
+            }
+            info!(
             "{} stream parsing TCP request on stream: {}",
             qconn.trace_id(),
             stream_id
         );
-        match HysteriaTcpRequest::from_bytes(&read_buf[..offset]) {
-            Some(req) => {
-                self.tcp_proxy_map
-                    .insert(stream_id, TCPProxyManager::new(req.url));
-                let resp =
-                    HysteriaTCPResponse::new(HysteriaTCPResponseStatus::Ok, "hello", "padding")
-                        .into_bytes();
-
-                match qconn.stream_send(stream_id, resp.as_slice(), false) {
-                    Ok(n) => {
-                        debug!("{} send {} bytes as TCP response", stream_id, n);
+            let (tx, rx) = mpsc::channel(65535);
+            let mut event:Option<HysEvent>=None;
+            //determine if this is a new proxy request or payload of an existing request
+            match HysteriaTcpRequest::from_bytes(&read_buf[..offset]) {
+                Some(req) => {
+                    // self.quic_context_map .insert(stream_id,TCPProxyManager::new(req.url));
+                    // let resp =
+                    //     HysteriaTCPResponse::new(HysteriaTCPResponseStatus::Ok, "hello", "padding")
+                    //         .into_bytes();
+                    // match qconn.stream_send(stream_id, resp.as_slice(), false) {
+                    //     Ok(n) => {
+                    //         debug!("{} send {} bytes as TCP response", stream_id, n);
+                    //     }
+                    //     Err(e) => {
+                    //         info!("TCP response: {e}");
+                    //     }
+                    // }
+                    if self.quic_context_map.get_mut(&stream_id).is_none() {
+                        let _ = event.insert(HysEvent::QuicEvent(stream_id, ProxyEvent::Request(
+                            req.url.clone(),
+                        ), tx));
+                        self.quic_context_map.insert(
+                            stream_id,
+                            QuicContext {
+                                queued_bytes: BytesMut::with_capacity(65535),
+                            },
+                        );
+                    } else {
+                        warn!("Client is sending new proxy request on a stream, {stream_id}, with a target")
                     }
-                    Err(e) => {
-                        info!("TCP response: {e}");
+                }
+                None => {
+                    if offset == 0 {
+                        info!("Client signifies the end of the stream, stream id: {}", stream_id);
+                        //this is highly coupling, which handles the event locally
+                        //but since the only use of a 0 offset receive event by definition
+                        //is the end of the stream, we just handle it here
+                        let shutdown_result = qconn.stream_shutdown(stream_id, Shutdown::Read, 0);
+                        match shutdown_result {
+                            Ok(_) | Err(quiche::Error::Done) => {
+                                let status = if shutdown_result.is_ok() { "shutdown" } else { "shutdown gracefully" };
+                                info!("{} stream {} {}", qconn.trace_id(), stream_id, status);
+                            }
+                            Err(e) => {
+                                warn!("{} stream {} shutdown error: {}", qconn.trace_id(), stream_id, e);
+                            }
+                        }
+                    } else {
+                        info!("we get the stream!");
+                        //COPY is blocking
+                        // match self.quic_context_map.get_mut(&stream_id) {
+                        //     Some(proxy_manager) => {
+                        //         if proxy_manager.stream.is_none()
+                        //             && proxy_manager
+                        //             .connection_handle
+                        //             .as_mut()
+                        //             .unwrap()
+                        //             .is_finished()
+                        //         {
+                        //             // proxy_manager.stream = proxy_manager.connection_handle.take().unwrap();
+                        //             if let Some(handle) = proxy_manager.connection_handle.take() {
+                        //                 proxy_manager.stream =
+                        //                     Some(proxy_manager.runtime.block_on(handle).unwrap()?);
+                        //                 info!("we get the stream!");
+                        //             }
+                        //         }
+                        //     }
+                        //     None => {
+                        //         error!(
+                        //         "{} TCP proxy not found for stream {}",
+                        //         qconn.trace_id(),
+                        //         stream_id
+                        //     );
+                        //     }
+                        // }
+                        let inbound_bytes = Bytes::copy_from_slice(&read_buf[..offset]);
+                       let _= event.insert(HysEvent::QuicEvent(stream_id, ProxyEvent::Payload(inbound_bytes), tx));
                     }
                 }
             }
-            None => {
-                if offset == 0 {
-                    warn!("Client signifies the end of the stream");
-                    match qconn.stream_shutdown(stream_id, Shutdown::Read, 0) {
-                        Err(quiche::Error::Done) => {
-                            info!(
-                                "{} stream {} shutdown gracefully",
-                                qconn.trace_id(),
-                                stream_id
-                            );
-                        }
-                        Ok(_) => {
-                            info!("{} stream {} shutdown ", qconn.trace_id(), stream_id);
-                        }
-                        Err(e) => {
-                            error!(
-                                "{} stream {} shutdown error: {}",
-                                qconn.trace_id(),
-                                stream_id,
-                                e
-                            );
-                        }
-                    }
-                } else {
-                    //COPY data would choose to be blocking
-                    match self.tcp_proxy_map.get_mut(&stream_id) {
-                        Some(proxy_manager) => {
-                            if proxy_manager.stream.is_none()
-                                && proxy_manager
-                                    .connection_handle
-                                    .as_mut()
-                                    .unwrap()
-                                    .is_finished()
-                            {
-                                // proxy_manager.stream = proxy_manager.connection_handle.take().unwrap();
-                                if let Some(handle) = proxy_manager.connection_handle.take() {
-                                    proxy_manager.stream =
-                                        Some(proxy_manager.runtime.block_on(handle).unwrap()?);
-                                    info!("we get the stream!");
-                                }
-                            }
-                        }
-                        None => {
-                            error!(
-                                "{} TCP proxy not found for stream {}",
-                                qconn.trace_id(),
-                                stream_id
-                            );
-                        }
-                    }
-                }
+            if event.is_some(){
+                self.event_sender.send(event.unwrap()).expect("sending failed");
+                self.waiting_streams.push(WaitForStream::QuicStream(
+                    WaitForQuicStream {
+                        stream_id,
+                        chan: Some(rx),
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn handle_h3_request(&mut self, qconn:&mut Connection) -> QuicResult<()> {
+         match self.h3conn_as_mut().poll(qconn) {
+            Ok((stream_id, event))=> {
+                let (tx, rx) = mpsc::channel(65535);
+
+                self.h3_context_map.insert(
+                    stream_id,
+                    H3Context {
+                        queued_frames: vec![],
+                    },
+                );
+                self.waiting_streams.push(WaitForStream::H3Stream(
+                    WaitForH3Stream {
+                        stream_id,
+                        chan: Some(rx),
+                    }));
+
+                self.event_sender
+                    .send(HysEvent::H3Event(stream_id, event, tx))
+                    .expect("sending failed");
+                Ok(())
+            }
+            Err(quiche::h3::Error::Done) => {
+                debug!("{} h3 conn done", qconn.trace_id());
+                Ok(())
+            }
+            Err(e)=>{
+                error!("{} h3 conn error: {}", qconn.trace_id(), e);
+               Err(Box::new(e))
             }
         }
     }
-    Ok(())
 }
 
 impl ApplicationOverQuic for HysDriver {
@@ -319,7 +354,8 @@ impl ApplicationOverQuic for HysDriver {
 
         select! {
             Some(ready) = self.waiting_streams.next() => self.upstream_ready(qconn, ready).unwrap(),
-             _ = tokio::time::sleep(Duration::from_millis(5000)) => { println!("outer timeout"); }
+            //_ = tokio::time::sleep(Duration::from_millis(500)) => { println!("outer timeout"); }
+            _ = std::future::pending::<()>() => unreachable!(),
     };
 
         Ok(())
@@ -327,35 +363,12 @@ impl ApplicationOverQuic for HysDriver {
 
         fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         debug!("{} process reads", qconn.trace_id());
-        loop {
+        while qconn.is_readable() {
             assert!(self.h3conn.is_some());
             if !self.is_verified {
-                if let Ok((stream_id, event)) = self.h3conn_as_mut().poll(qconn) {
-                    let (tx, rx) = mpsc::channel(65535);
-                    self.h3_context_map.insert(
-                        stream_id,
-                        H3Context {
-                            receiver: Some(rx),
-                            queued_frames: vec![],
-                        },
-                    );
-                    self.waiting_streams.push(WaitForStream::H3Stream(
-                        WaitForH3Stream{
-                            stream_id,
-                            chan: self.h3_context_map.get_mut(&stream_id).unwrap().receiver.take(),
-                        }));
-
-                    self.event_sender
-                        .send(HysEvent::H3Event(stream_id, event, tx))
-                        .expect("sending failed");
-
-
-                } else {
-                    warn!("{} h3conn poll failed", qconn.trace_id());
-                }
-            }
-            if !qconn.is_readable() {
-                break;
+                self.handle_h3_request(qconn)?
+            }else{
+                self.handle_quic_request(qconn)?;
             }
         }
         Ok(())
@@ -363,31 +376,24 @@ impl ApplicationOverQuic for HysDriver {
 
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
         for stream_id in qconn.writable() {
-            debug!("stream {} writable", stream_id);
+            trace!("stream {} writable", stream_id);
+            if !self.is_verified{
             if let Some(context) = self.h3_context_map.get_mut(&stream_id) {
-                if let Some(receiver) = context.receiver.as_mut() {
-                    match receiver.try_recv() {
-                        Ok(h3_response) => {
-                            warn!("quiche received the message");
-                            // Successfully received, add to queued frames
-                            context.queued_frames.push(h3_response);
-                            // Set receiver to None since it's been consumed
-                            context.receiver = None;
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => {
-                            self.waiting_streams.push(WaitForStream::H3Stream(
-                                WaitForH3Stream{
-                                    stream_id,
-                                    chan: self.h3_context_map.get_mut(&stream_id).unwrap().receiver.take(),
-                                }));
-                        }
-                        other => info!("H3 response error: {:?}", other),
+                if !context.queued_frames.is_empty() {
+                    info!("Received {} frames", context.queued_frames.len());
+                    let mut responses_to_process = Vec::new();
+                    while let Some(response) = context.queued_frames.pop() {
+                        responses_to_process.push(response);
                     }
-                }
-            } else if !self.is_verified {
+                    for response in responses_to_process {
+                        self.handle_h3_response(qconn, stream_id, &response);
+                    }
+                }}
+            else {
                 debug!("new unverified stream id: {}", stream_id);
             }
         }
-        Ok(())
+
     }
-}
+        Ok(())
+}}
