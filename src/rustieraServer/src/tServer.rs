@@ -7,10 +7,10 @@ use log::{debug, info, warn};
 use quiche::h3;
 use std::collections::BTreeMap;
 use tokio::runtime::Handle;
+use tokio_quiche::listen;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::ConnectionParams;
-use tokio_quiche::listen;
 
 const HOSTNAME: &str = "0.0.0.0";
 const LISTEN_PORT: u16 = 8888;
@@ -50,7 +50,7 @@ async fn server() {
 }
 async fn handle_connection(mut controller: HysController, handle: Handle) {
     let stream_map: BTreeMap<u64, stream_handler> = BTreeMap::new();
-    let mut verified: bool = false;
+    let mut is_verified: bool = false;
     while let Some(event) = controller.event_receiver_mut().recv().await {
         debug!("event received:{:?}", event);
         //each HysEvent correspond to a connection which should have its states
@@ -58,13 +58,16 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
         match event {
             //handle H3 event locally because ideally all auth event should be one shot
             HysEvent::H3Event(stream_id, h3_event, sender) => {
-                if !verified {
+                if !is_verified {
                     match h3_event {
                         h3::Event::Headers { list, .. } => {
                             let (auth_res, response) = auth::auth(list);
-                            verified = auth_res;
+                            is_verified = auth_res;
                             //ignore sending error for now
-                            sender.send(H3Response { auth_res, response }).await.unwrap();
+                            sender
+                                .send(H3Response { auth_res, response })
+                                .await
+                                .unwrap();
                         }
                         h3::Event::Finished => {
                             //self.h3_outbound_map.remove(&stream_id);
@@ -78,7 +81,8 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
                 } else {
                     warn!("Verified user is sending h3 request again");
                 }
-                drop(sender); 
+                //TODO: maybe use oneshot channel
+                drop(sender);
             }
             HysEvent::QuicEvent(stream_id, bytes, sender) => {
                 warn!("handle quic event");

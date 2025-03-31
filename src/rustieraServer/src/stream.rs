@@ -1,8 +1,8 @@
 use crate::hysteria::H3Response;
 use bytes::Bytes;
+use log::{debug, error};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use log::{debug, error};
 use tokio::sync::mpsc::Receiver;
 use tokio_quiche::datagram_socket::DatagramSocketRecv;
 
@@ -39,15 +39,19 @@ impl Future for WaitForH3Stream {
     type Output = ReceivedH3Stream;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        debug!("H3 upstream channel closed? {}",self.chan.as_mut().unwrap().is_closed());
-        self.chan.as_mut().unwrap().poll_recv(cx).map(|data| {
-            ReceivedH3Stream {
+        debug!(
+            "H3 upstream channel closed? {}",
+            self.chan.as_mut().unwrap().is_closed()
+        );
+        self.chan
+            .as_mut()
+            .unwrap()
+            .poll_recv(cx)
+            .map(|data| ReceivedH3Stream {
                 stream_id: self.stream_id,
                 chan: self.chan.take().unwrap(),
                 response: data,
-            }
-        })
-        
+            })
     }
 }
 
