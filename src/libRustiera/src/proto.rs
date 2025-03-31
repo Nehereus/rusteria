@@ -71,10 +71,13 @@ impl HysteriaTcpRequest {
         let padding_len = cursor.read_u8().ok()?;
         let mut padding = vec![0; padding_len as usize];
         cursor.read_exact(&mut padding).ok()?;
+        let remaining_bytes = bytes.len() - cursor.position() as usize;
         info!(
-            "Parsed TCP request: request_id={}, addr_len={}, url={}, padding_len={}",
-            request_id, addr_len, url, padding_len
+            "Parsed TCP request: request_id={}, addr_len={}, url={}, padding_len={}, remaining_bytes={}",
+            request_id, addr_len, url, padding_len, remaining_bytes
         );
+        //print remaining bytes
+        warn!("Remaining bytes: {:?}", &bytes[cursor.position() as usize..]);
         Some(Self {
             reqest_id: request_id,
             url_len: addr_len,
@@ -91,9 +94,9 @@ impl HysteriaTcpRequest {
 // [bytes] Random padding
 pub struct HysteriaTCPResponse {
     pub status: HysteriaTCPResponseStatus,
-    msg_len: u16,
+    msg_len: u8,
     pub msg: Vec<u8>,
-    padding_len: u16,
+    padding_len: u8,
     pub padding: Vec<u8>,
 }
 pub enum HysteriaTCPResponseStatus {
@@ -102,11 +105,12 @@ pub enum HysteriaTCPResponseStatus {
 }
 impl HysteriaTCPResponse {
     pub fn new(status: HysteriaTCPResponseStatus, msg: &str, padding: &str) -> Self {
+        error!("padding length: {}", padding.len());
         Self {
             status,
-            msg_len: msg.len() as u16,
+            msg_len: msg.len() as u8,
             msg: msg.as_bytes().to_vec(),
-            padding_len: padding.len() as u16,
+            padding_len: padding.len() as u8,
             padding: padding.as_bytes().to_vec(),
         }
     }

@@ -1,16 +1,21 @@
 use crate::auth;
 use crate::handler::stream_handler;
-use crate::hysteria::{H3Response, HysController, HysDriver, HysEvent};
+use crate::hysteria::{H3Response, HysController, HysDriver, HysEvent, ProxyEvent};
+use crate::proxy::ProxyManager;
 use env_logger;
 use futures::stream::StreamExt;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use quiche::h3;
 use std::collections::BTreeMap;
+use bytes::Bytes;
 use tokio::runtime::Handle;
-use tokio_quiche::listen;
+use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_quiche::{listen, QuicResult};
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::ConnectionParams;
+use quiche::Config;
+use libRustiera::proto::{HysteriaTCPResponse, HysteriaTCPResponseStatus};
 
 const HOSTNAME: &str = "0.0.0.0";
 const LISTEN_PORT: u16 = 8888;
@@ -24,11 +29,12 @@ async fn server() {
     env_logger::init();
     let addr: String = format!("{}:{}", HOSTNAME, LISTEN_PORT);
     let socket = tokio::net::UdpSocket::bind(addr).await.unwrap();
+    let mut quic_settings = tokio_quiche::settings::QuicSettings::default();
+    quic_settings.keylog_file= Some("/tmp/keyl".to_string());
     let mut listeners = listen(
         [socket],
         ConnectionParams::new_server(
-            //modify quic config here
-            tokio_quiche::settings::QuicSettings::default(),
+            quic_settings,
             tokio_quiche::settings::TlsCertificatePaths {
                 cert: "/tmp/cert/cert.pem",
                 private_key: "/tmp/cert/key.pem",
@@ -49,7 +55,7 @@ async fn server() {
     }
 }
 async fn handle_connection(mut controller: HysController, handle: Handle) {
-    let stream_map: BTreeMap<u64, stream_handler> = BTreeMap::new();
+    let mut proxy_map: BTreeMap<u64, Sender<Bytes>> = BTreeMap::new();
     let mut is_verified: bool = false;
     while let Some(event) = controller.event_receiver_mut().recv().await {
         debug!("event received:{:?}", event);
@@ -84,8 +90,38 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
                 //TODO: maybe use oneshot channel
                 drop(sender);
             }
-            HysEvent::QuicEvent(stream_id, bytes, sender) => {
-                warn!("handle quic event");
+            HysEvent::QuicEvent(stream_id, proxy_event) => {
+                match proxy_event {
+                    ProxyEvent::Request(url, sender) => {
+                        info!("Received request for url: {}", url);
+                        let (tx, rx) = tokio::sync::mpsc::channel(65535);
+                        proxy_map.insert(stream_id, tx);
+                        let proxy_response = HysteriaTCPResponse::new(
+                            HysteriaTCPResponseStatus::Ok,
+                            "Hello World!",
+                            "padding",
+                        ).into_bytes();
+                        sender
+                            .send(Bytes::from(proxy_response)).await.unwrap();
+                        let mut proxy_manager = ProxyManager::new(url, sender.clone(), rx );
+                        handle.spawn(async move {
+                            proxy_manager.start().await;
+                        });
+                    }
+                    ProxyEvent::Payload(payload) => {
+                        info!("Received proxy payload for stream id: {}", stream_id);
+                        if(proxy_map.contains_key(&stream_id)){
+                            proxy_map
+                                .get_mut(&stream_id)
+                                .unwrap()
+                                .send(payload)
+                                .await
+                                .unwrap();
+                        }else{
+                            error!("stream id: {} not registered with a target", stream_id);
+                        }
+                    }
+                }
             }
         }
     }

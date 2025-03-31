@@ -30,9 +30,9 @@ pub struct ReceivedH3Stream {
 }
 
 pub struct ReceivedQuicStream {
-    stream_id: u64,
-    chan: Receiver<Bytes>,
-    response: Option<Bytes>,
+   pub stream_id: u64,
+   pub chan: Receiver<Bytes>,
+   pub response: Option<Bytes>,
 }
 
 impl Future for WaitForH3Stream {
@@ -58,6 +58,7 @@ impl Future for WaitForH3Stream {
 impl Future for WaitForQuicStream {
     type Output = ReceivedQuicStream;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        error!("QUIC channel closed? {}", self.chan.as_mut().unwrap().is_closed());
         self.chan
             .as_mut()
             .unwrap()

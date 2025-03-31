@@ -1,21 +1,13 @@
-use crate::stream::{
-    ReceivedH3Stream, StreamReady, WaitForH3Stream, WaitForQuicStream, WaitForStream,
-};
-use bytes::{Bytes, BytesMut};
+use crate::stream::{ReceivedH3Stream, ReceivedQuicStream, StreamReady, WaitForH3Stream, WaitForQuicStream, WaitForStream};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::StreamExt;
-use futures::channel::mpsc::Sender;
 use futures::stream::FuturesUnordered;
-use libRustiera::proto::{HysteriaTCPResponse, HysteriaTCPResponseStatus, HysteriaTcpRequest};
+use libRustiera::proto::HysteriaTcpRequest;
 use log::{debug, error, info, trace, warn};
 use quiche::{Connection, Shutdown};
 use std::collections::BTreeMap;
-use std::io;
-use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::runtime::Runtime;
+use tokio::select;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::{runtime, select};
 use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::buffer_pool::PooledBuf;
 use tokio_quiche::http3::driver::OutboundFrame;
@@ -30,12 +22,12 @@ pub struct H3Response {
 #[derive(Debug)]
 pub enum HysEvent {
     H3Event(u64, quiche::h3::Event, mpsc::Sender<H3Response>),
-    QuicEvent(u64, ProxyEvent, mpsc::Sender<Bytes>),
+    QuicEvent(u64, ProxyEvent),
 }
 #[derive(Debug)]
 pub enum ProxyEvent {
     //url
-    Request(String),
+    Request(String, mpsc::Sender<Bytes>),
     Payload(Bytes),
 }
 
@@ -97,7 +89,7 @@ impl HysDriver {
     ) -> Result<(), quiche::h3::Error> {
         match ready {
             StreamReady::H3Stream(r) => self.h3_ready(qconn, r),
-            StreamReady::QuicStream(r) => Ok(()), //TODO
+            StreamReady::QuicStream(r) => self.quic_ready(qconn,r), 
         }
     }
     fn h3_ready(
@@ -116,6 +108,35 @@ impl HysDriver {
                 // Get the response data before processing
                 if let Some(response) = response {
                     stream.queued_frames.push(response);
+                }
+                Ok(())
+            }
+        }
+    }
+    fn quic_ready(
+        &mut self,
+        qconn: &mut QuicheConnection,
+        quic_ready: ReceivedQuicStream,
+    ) -> Result<(), quiche::h3::Error> {
+        let ReceivedQuicStream {
+            stream_id,
+            chan,
+            response,
+        } = quic_ready;
+        //rearm the waiting_streams
+        if !chan.is_closed(){
+            self.waiting_streams.push(WaitForStream::QuicStream(WaitForQuicStream {
+                stream_id,
+                chan: Some(chan),
+            }));
+        }
+        match self.quic_context_map.get_mut(&stream_id) {
+            None => Ok(()),
+            Some(stream) => {
+                // Get the response data before processing
+                if let Some(response) = response {
+                    info!("{} quic stream {} read: {}", qconn.trace_id(), stream_id, response.len());
+                    stream.queued_bytes.extend_from_slice(&response);
                 }
                 Ok(())
             }
@@ -191,6 +212,7 @@ impl HysDriver {
             let mut offset = 0;
             while qconn.stream_readable(stream_id) {
                 let (read, fin) = qconn.stream_recv(stream_id, &mut read_buf[offset..])?;
+                info!("{} quic stream {} read: {}", qconn.trace_id(), stream_id, read);
                 offset += read;
             }
             info!(
@@ -203,23 +225,10 @@ impl HysDriver {
             //determine if this is a new proxy request or payload of an existing request
             match HysteriaTcpRequest::from_bytes(&read_buf[..offset]) {
                 Some(req) => {
-                    // self.quic_context_map .insert(stream_id,TCPProxyManager::new(req.url));
-                    // let resp =
-                    //     HysteriaTCPResponse::new(HysteriaTCPResponseStatus::Ok, "hello", "padding")
-                    //         .into_bytes();
-                    // match qconn.stream_send(stream_id, resp.as_slice(), false) {
-                    //     Ok(n) => {
-                    //         debug!("{} send {} bytes as TCP response", stream_id, n);
-                    //     }
-                    //     Err(e) => {
-                    //         info!("TCP response: {e}");
-                    //     }
-                    // }
                     if self.quic_context_map.get_mut(&stream_id).is_none() {
                         let _ = event.insert(HysEvent::QuicEvent(
                             stream_id,
-                            ProxyEvent::Request(req.url.clone()),
-                            tx,
+                            ProxyEvent::Request(req.url, tx),
                         ));
                         self.quic_context_map.insert(
                             stream_id,
@@ -262,43 +271,16 @@ impl HysDriver {
                             }
                         }
                     } else {
-                        info!("we get the stream!");
-                        //COPY is blocking
-                        // match self.quic_context_map.get_mut(&stream_id) {
-                        //     Some(proxy_manager) => {
-                        //         if proxy_manager.stream.is_none()
-                        //             && proxy_manager
-                        //             .connection_handle
-                        //             .as_mut()
-                        //             .unwrap()
-                        //             .is_finished()
-                        //         {
-                        //             // proxy_manager.stream = proxy_manager.connection_handle.take().unwrap();
-                        //             if let Some(handle) = proxy_manager.connection_handle.take() {
-                        //                 proxy_manager.stream =
-                        //                     Some(proxy_manager.runtime.block_on(handle).unwrap()?);
-                        //                 info!("we get the stream!");
-                        //             }
-                        //         }
-                        //     }
-                        //     None => {
-                        //         error!(
-                        //         "{} TCP proxy not found for stream {}",
-                        //         qconn.trace_id(),
-                        //         stream_id
-                        //     );
-                        //     }
-                        // }
                         let inbound_bytes = Bytes::copy_from_slice(&read_buf[..offset]);
                         let _ = event.insert(HysEvent::QuicEvent(
                             stream_id,
                             ProxyEvent::Payload(inbound_bytes),
-                            tx,
                         ));
                     }
                 }
             }
             if event.is_some() {
+                info!("{} send event: {:?}", qconn.trace_id(), event);
                 self.event_sender
                     .send(event.unwrap())
                     .expect("sending failed");
@@ -385,9 +367,8 @@ impl ApplicationOverQuic for HysDriver {
     }
 
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> QuicResult<()> {
-        debug!("{} process reads", qconn.trace_id());
         while qconn.is_readable() {
-            assert!(self.h3conn.is_some());
+            debug!("{} process reads", qconn.trace_id());
             if !self.is_verified {
                 self.handle_h3_request(qconn)?
             } else {
@@ -409,11 +390,27 @@ impl ApplicationOverQuic for HysDriver {
                             responses_to_process.push(response);
                         }
                         for response in responses_to_process {
-                            self.handle_h3_response(qconn, stream_id, &response);
+                            self.handle_h3_response(qconn, stream_id, &response).expect("TODO: panic message");
                         }
                     }
                 } else {
-                    debug!("new unverified stream id: {}", stream_id);
+                    //TODO: proper logging
+                    trace!("new unverified stream id: {}", stream_id);
+                }
+            }else{
+                if let Some(context) = self.quic_context_map.get_mut(&stream_id){
+                    if !context.queued_bytes.is_empty(){
+                        info!("writing to the proxy client. Bytes len: {}", context.queued_bytes.len());
+                        info!("bytes content in bytes: {:?}", context.queued_bytes);
+                        info!("bytes content in ascii: {}", String::from_utf8_lossy(&context.queued_bytes));
+                        let bytes_to_send = context.queued_bytes.clone();
+                        let sent = qconn.stream_send(stream_id, &bytes_to_send, false)?;
+                        if sent == bytes_to_send.len() {
+                            context.queued_bytes.clear();
+                        } else {
+                            context.queued_bytes.advance(sent);
+                        }
+                    }
                 }
             }
         }
