@@ -23,7 +23,9 @@ pub fn main() {
 }
 #[tokio::main]
 async fn server() {
+    console_subscriber::init();
     env_logger::init();
+    
     let addr: String = format!("{}:{}", HOSTNAME, LISTEN_PORT);
     let socket = tokio::net::UdpSocket::bind(addr).await.unwrap();
     let mut quic_settings = tokio_quiche::settings::QuicSettings::default();
@@ -108,12 +110,13 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
                     ProxyEvent::Payload(payload) => {
                         info!("Received proxy payload for stream id: {}", stream_id);
                         if proxy_map.contains_key(&stream_id) {
-                            proxy_map
+                          if let Err(e) =proxy_map
                                 .get_mut(&stream_id)
                                 .unwrap()
                                 .send(payload)
-                                .await
-                                .unwrap();
+                                .await{
+                                    error!("Failed to send payload to the proxy unit: {}", e);
+                                }
                         }else{
                             error!("stream id: {} not registered with a target", stream_id);
                         }

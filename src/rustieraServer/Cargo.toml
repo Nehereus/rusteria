@@ -6,9 +6,10 @@ edition = "2024"
 quiche = "*"
 log = {version = "*",features = ["kv"]}
 env_logger="*"
-tokio = { version = "*",features = ["full"] }
+tokio = { version = "*",features = ["full", "tracing"] }
 libRustiera = { path = "../libRustiera" }
 tokio-quiche="*"
 futures = "0.3.31"
 bytes = "1.10.1"
+console-subscriber="*"
 

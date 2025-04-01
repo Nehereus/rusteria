@@ -272,10 +272,12 @@ impl HysDriver {
                 }
             }
             if event.is_some() {
-                info!("{} sending event to the handler: {:?}", qconn.trace_id(), event);
-                self.event_sender
-                    .send(event.unwrap())
-                    .expect("sending failed");
+                trace!("{} sending event to the handler: {:?}", qconn.trace_id(), event);
+                if let Err(e) = self.event_sender
+                    .send(event.unwrap()){
+                    //TODO receiver closed 
+                    error!("Failed to send event to the handler: {}", e);
+                }
                 self.waiting_streams
                     .push(WaitForStream::QuicStream(WaitForQuicStream {
                         stream_id,

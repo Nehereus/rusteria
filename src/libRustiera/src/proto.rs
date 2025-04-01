@@ -1,8 +1,5 @@
-use byteorder::{BigEndian, ReadBytesExt};
 use log::{debug, error, info, warn};
 use quiche::h3::{Header, NameValue};
-use std::io::{Cursor, Read};
-use std::net::Ipv4Addr;
 use octets::Octets;
 use quiche::Error;
 

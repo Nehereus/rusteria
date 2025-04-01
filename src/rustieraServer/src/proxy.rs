@@ -117,7 +117,13 @@ impl ProxyManager {
                         self.read_buffer.advance(n);
                         //no need to add back the capacity after splitting
                         //because writing to the buffer is handled using extend_from_slice
-                       self.read_buffer =self.read_buffer.split_off(n);
+                        //TODO bug n>capacity
+                        if n < self.read_buffer.capacity() {
+                            self.read_buffer =self.read_buffer.split_off(n);
+                        }else{
+                            self.read_buffer.clear();
+                        }
+                       
                     }
                     Err(e) => return Err(e),
                 }
