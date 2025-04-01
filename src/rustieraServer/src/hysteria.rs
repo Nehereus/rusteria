@@ -62,6 +62,10 @@ struct QuicContext {
 }
 impl HysDriver {
     pub fn new() -> (Self, HysController) {
+        let mut h3config = quiche::h3::Config::new().unwrap();
+        h3config.set_qpack_max_table_capacity(64);
+        h3config.set_qpack_blocked_streams(64);
+        
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         (
             Self {
@@ -69,7 +73,7 @@ impl HysDriver {
                 buffer: BufFactory::get_max_buf(),
                 is_verified: false,
                 h3conn: None,
-                h3config: quiche::h3::Config::new().unwrap(),
+                h3config,
                 event_sender,
                 h3_context_map: BTreeMap::new(),
                 quic_context_map: BTreeMap::new(),
@@ -89,7 +93,7 @@ impl HysDriver {
     ) -> Result<(), quiche::h3::Error> {
         match ready {
             StreamReady::H3Stream(r) => self.h3_ready(qconn, r),
-            StreamReady::QuicStream(r) => self.quic_ready(qconn,r), 
+            StreamReady::QuicStream(r) => self.quic_ready(qconn,r),
         }
     }
     fn h3_ready(
@@ -212,75 +216,63 @@ impl HysDriver {
             let mut offset = 0;
             while qconn.stream_readable(stream_id) {
                 let (read, fin) = qconn.stream_recv(stream_id, &mut read_buf[offset..])?;
-                info!("{} quic stream {} read: {}", qconn.trace_id(), stream_id, read);
+                debug!("{} quic stream {} read: {}", qconn.trace_id(), stream_id, read);
                 offset += read;
             }
-            info!(
-                "{} stream parsing TCP request on stream: {}",
-                qconn.trace_id(),
-                stream_id
-            );
             let (tx, rx) = mpsc::channel(65535);
             let mut event: Option<HysEvent> = None;
             //determine if this is a new proxy request or payload of an existing request
-            match HysteriaTcpRequest::from_bytes(&read_buf[..offset]) {
-                Some(req) => {
-                    if self.quic_context_map.get_mut(&stream_id).is_none() {
-                        let _ = event.insert(HysEvent::QuicEvent(
-                            stream_id,
-                            ProxyEvent::Request(req.url, tx),
-                        ));
-                        self.quic_context_map.insert(
-                            stream_id,
-                            QuicContext {
-                                queued_bytes: BytesMut::with_capacity(65535),
-                            },
-                        );
-                    } else {
-                        warn!(
-                            "Client is sending new proxy request on a stream, {stream_id}, with a target"
-                        )
-                    }
-                }
-                None => {
-                    if offset == 0 {
-                        info!(
-                            "Client signifies the end of the stream, stream id: {}",
-                            stream_id
-                        );
-                        //this is highly coupling, which handles the event locally
-                        //but since the only use of a 0 offset receive event by definition
-                        //is the end of the stream, we just handle it here
-                        let shutdown_result = qconn.stream_shutdown(stream_id, Shutdown::Read, 0);
-                        match shutdown_result {
-                            Ok(_) | Err(quiche::Error::Done) => {
-                                let status = if shutdown_result.is_ok() {
-                                    "shutdown"
-                                } else {
-                                    "shutdown gracefully"
-                                };
-                                info!("{} stream {} {}", qconn.trace_id(), stream_id, status);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "{} stream {} shutdown error: {}",
-                                    qconn.trace_id(),
-                                    stream_id,
-                                    e
-                                );
-                            }
+            // if let Some(req) =HysteriaTcpRequest::from_bytes(&read_buf[..offset]) {
+            //         if self.quic_context_map.get_mut(&stream_id).is_none() {
+            if self.quic_context_map.get_mut(&stream_id).is_none(){
+               if let Some(req) =  HysteriaTcpRequest::from_bytes(&read_buf[..offset]){
+                   let _ = event.insert(HysEvent::QuicEvent(
+                       stream_id,
+                       ProxyEvent::Request(req.url, tx),
+                   ));
+                   self.quic_context_map.insert(
+                       stream_id,
+                       QuicContext {
+                           queued_bytes: BytesMut::with_capacity(65535),
+                       },
+                   ); 
+               }else{
+                   error!("client is sending invalid initial proxy request");
+               }
+            }else {
+                if offset == 0 {
+                    info!(
+                        "Client signifies the end of the stream, stream id: {}",
+                        stream_id
+                    );
+                    //this is highly coupling, which handles the event locally
+                    //but since the only use of a 0 offset receive event by definition
+                    //is the end of the stream, we just handle it here
+                    let shutdown_result = qconn.stream_shutdown(stream_id, Shutdown::Read, 0);
+                    //TODO refactor. coding style is awakward
+                    match shutdown_result {
+                        Ok(_) | Err(quiche::Error::Done) => {
+                            info!("{} stream {} was shutdown gracefully", qconn.trace_id(), stream_id);
                         }
-                    } else {
-                        let inbound_bytes = Bytes::copy_from_slice(&read_buf[..offset]);
-                        let _ = event.insert(HysEvent::QuicEvent(
-                            stream_id,
-                            ProxyEvent::Payload(inbound_bytes),
-                        ));
+                        Err(e) => {
+                            warn!(
+                                "{} stream {} shutdown error: {}",
+                                qconn.trace_id(),
+                                stream_id,
+                                e
+                            );
+                        }
                     }
+                } else {
+                    let inbound_bytes = Bytes::copy_from_slice(&read_buf[..offset]);
+                    let _ = event.insert(HysEvent::QuicEvent(
+                        stream_id,
+                        ProxyEvent::Payload(inbound_bytes),
+                    ));
                 }
             }
             if event.is_some() {
-                info!("{} send event: {:?}", qconn.trace_id(), event);
+                info!("{} sending event to the handler: {:?}", qconn.trace_id(), event);
                 self.event_sender
                     .send(event.unwrap())
                     .expect("sending failed");
@@ -384,7 +376,7 @@ impl ApplicationOverQuic for HysDriver {
             if !self.is_verified {
                 if let Some(context) = self.h3_context_map.get_mut(&stream_id) {
                     if !context.queued_frames.is_empty() {
-                        info!("Received {} frames", context.queued_frames.len());
+                        debug!("Writing {} h3 frame(s) to the client", context.queued_frames.len());
                         let mut responses_to_process = Vec::new();
                         while let Some(response) = context.queued_frames.pop() {
                             responses_to_process.push(response);
@@ -400,9 +392,8 @@ impl ApplicationOverQuic for HysDriver {
             }else{
                 if let Some(context) = self.quic_context_map.get_mut(&stream_id){
                     if !context.queued_bytes.is_empty(){
-                        info!("writing to the proxy client. Bytes len: {}", context.queued_bytes.len());
-                        info!("bytes content in bytes: {:?}", context.queued_bytes);
-                        info!("bytes content in ascii: {}", String::from_utf8_lossy(&context.queued_bytes));
+                        debug!("writing len {} bytes quic traffic to the client", context.queued_bytes.len());
+                        trace!("bytes content in ascii: {}", String::from_utf8_lossy(&context.queued_bytes));
                         let bytes_to_send = context.queued_bytes.clone();
                         let sent = qconn.stream_send(stream_id, &bytes_to_send, false)?;
                         if sent == bytes_to_send.len() {

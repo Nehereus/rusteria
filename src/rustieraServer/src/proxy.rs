@@ -2,7 +2,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 use std::io::Read;
 use std::sync::mpsc::SendError;
-use log::{error, info};
+use log::{error, info, trace};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -43,9 +43,9 @@ impl ProxyManager {
             loop {
                 select! {
                     Some(bytes) = receiver.recv() => {
-                        info!("Received bytes from channel: {:?}", bytes);
+                        info!("Proxy unit received {} bytes payload from the client", bytes.len());
                         self.read_buffer.extend_from_slice(&bytes);
-                        if let Err(e) = self.send_to_target().await {
+                        if let Err(e) = self.send_to_server().await {
                             error!("Send error: {}", e);
                             break;
                         }
@@ -81,9 +81,9 @@ impl ProxyManager {
             match stream.read(&mut buf).await {
                 Ok(n)  => {
                     if n>0 {
-                        info!("Received {} bytes from remote", n);
+                        info!("Received {} bytes from the remote", n);
                         self.write_buffer.extend_from_slice(&buf[..n]);
-                        error!("New buffer length: {}", self.write_buffer.len());
+                        trace!("New write buffer length: {}", self.write_buffer.len());
                     }else{
                         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Connection closed"));
                     }
@@ -101,7 +101,7 @@ impl ProxyManager {
         Ok(())
     }
 
-    pub async fn send_to_target(&mut self) -> Result<(), io::Error> {
+    pub async fn send_to_server(&mut self) -> Result<(), io::Error> {
         if let Some(ref mut stream) = self.stream {
             if !self.read_buffer.is_empty() {
                 let bytes_to_send = self.read_buffer.len();
@@ -113,8 +113,11 @@ impl ProxyManager {
                     }
                     Ok(n) => {
                         // Remove the sent bytes from the buffer
-                        info!("Sent {} bytes to target", n);
+                        info!("Sent {} bytes to the remote", n);
                         self.read_buffer.advance(n);
+                        //no need to add back the capacity after splitting
+                        //because writing to the buffer is handled using extend_from_slice
+                       self.read_buffer =self.read_buffer.split_off(n);
                     }
                     Err(e) => return Err(e),
                 }
@@ -128,11 +131,12 @@ impl ProxyManager {
                 let bytes_to_send = self.write_buffer.len();
                 match self.sender.send(Bytes::copy_from_slice(&self.write_buffer[..bytes_to_send])).await {
                     Ok(()) => {
-                        info!("Sent {} bytes to channel", bytes_to_send);
+                        info!("Sent {} bytes to the channel", bytes_to_send);
+                        self.write_buffer.clear();
                         return Ok(());
                     }
                     Err(e) =>{
-                        error!("Error sending to channel: {}", e);
+                        error!("Error sending to the channel: {}", e);
                         e
                     } 
                 };

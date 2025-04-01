@@ -172,6 +172,7 @@ dependencies = [
  "byteorder",
  "env_logger",
  "log",
+ "octets",
  "quiche",
 ]
 

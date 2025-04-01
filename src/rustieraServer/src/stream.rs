@@ -58,7 +58,7 @@ impl Future for WaitForH3Stream {
 impl Future for WaitForQuicStream {
     type Output = ReceivedQuicStream;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        error!("QUIC channel closed? {}", self.chan.as_mut().unwrap().is_closed());
+        debug!("QUIC channel closed? {}", self.chan.as_mut().unwrap().is_closed());
         self.chan
             .as_mut()
             .unwrap()

@@ -21,14 +21,13 @@ const LISTEN_PORT: u16 = 8888;
 pub fn main() {
     server();
 }
-
 #[tokio::main]
 async fn server() {
     env_logger::init();
     let addr: String = format!("{}:{}", HOSTNAME, LISTEN_PORT);
     let socket = tokio::net::UdpSocket::bind(addr).await.unwrap();
     let mut quic_settings = tokio_quiche::settings::QuicSettings::default();
-    quic_settings.keylog_file= Some("/tmp/keyl".to_string());
+    quic_settings.keylog_file= Some("/tmp/keylog.txt".to_string());
     let mut listeners = listen(
         [socket],
         ConnectionParams::new_server(

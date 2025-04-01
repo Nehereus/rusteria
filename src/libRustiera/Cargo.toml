@@ -8,3 +8,5 @@ quiche = "*"
 log = "*"
 env_logger = "*"
 byteorder = "*"
+octets = "*"
+
