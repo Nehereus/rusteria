@@ -1,10 +1,14 @@
 use crate::hysteria::H3Response;
 use bytes::Bytes;
-use log::{debug, error};
+use log::{debug};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc::Receiver;
-use tokio_quiche::datagram_socket::DatagramSocketRecv;
+
+pub struct HysResponse {
+    pub bytes: Bytes,
+    pub fin: bool,
+}
 
 pub enum WaitForStream {
     H3Stream(WaitForH3Stream),
@@ -20,7 +24,7 @@ pub struct WaitForH3Stream {
 }
 pub struct WaitForQuicStream {
     pub(crate) stream_id: u64,
-    pub(crate) chan: Option<Receiver<Bytes>>,
+    pub(crate) chan: Option<Receiver<HysResponse>>,
 }
 
 pub struct ReceivedH3Stream {
@@ -30,9 +34,9 @@ pub struct ReceivedH3Stream {
 }
 
 pub struct ReceivedQuicStream {
-   pub stream_id: u64,
-   pub chan: Receiver<Bytes>,
-   pub response: Option<Bytes>,
+    pub stream_id: u64,
+    pub chan: Receiver<HysResponse>,
+    pub response: Option<HysResponse>,
 }
 
 impl Future for WaitForH3Stream {
@@ -58,7 +62,10 @@ impl Future for WaitForH3Stream {
 impl Future for WaitForQuicStream {
     type Output = ReceivedQuicStream;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        debug!("QUIC channel closed? {}", self.chan.as_mut().unwrap().is_closed());
+        debug!(
+            "QUIC channel closed? {}",
+            self.chan.as_mut().unwrap().is_closed()
+        );
         self.chan
             .as_mut()
             .unwrap()

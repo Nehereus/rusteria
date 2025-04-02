@@ -1,4 +1,4 @@
-use libRustiera::proto::*;
+use lib_rusteria::proto::*;
 use quiche::h3::Header;
 use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::http3::driver::OutboundFrame;
@@ -6,15 +6,15 @@ use tokio_quiche::http3::driver::OutboundFrame;
 //TODO: auth should always return a response regardless of the auth result;
 // in case of success auth, it should return a success AuthResponse
 // else return masq
-pub fn auth(headers: Vec<Header>) -> (bool, Vec<OutboundFrame>) {
+pub fn auth(headers: Vec<Header>, auth_token: &str) -> (bool, Vec<OutboundFrame>) {
     if let Ok(req) = AuthRequest::from_event_header(headers.as_slice()) {
-        if verify(req.auth_token) {
+        if verify(req.auth_token, auth_token) {
             let auth_resp = AuthResponse {
                 status: 233,
                 udp_supported: false,
                 server_rx: 0,
                 rx_auto: true,
-                padding: "8964",
+                padding: "padding",
             };
             let v = vec![OutboundFrame::Headers(auth_resp.to_headers())];
             (true, v)
@@ -25,9 +25,10 @@ pub fn auth(headers: Vec<Header>) -> (bool, Vec<OutboundFrame>) {
         (false, masquerade())
     }
 }
+
 //TODO implement verification
-fn verify(token: &str) -> bool {
-    return token.eq("8964");
+fn verify(token: &str, auth_token: &str) -> bool {
+    token.eq(auth_token)
 }
 
 //TODO implement masquerade

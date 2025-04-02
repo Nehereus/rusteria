@@ -3,6 +3,11 @@ name = "rusteria"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    "src/libRusteria",
+    "src/rusteriaServer"
+]
+
 [dependencies]
-quiche = "*"
-log = "*"
+lib_rusteria = { path = "src/libRusteria" }

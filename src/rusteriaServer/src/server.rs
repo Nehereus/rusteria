@@ -1,42 +1,38 @@
 use crate::auth;
 use crate::hysteria::{H3Response, HysController, HysDriver, HysEvent, ProxyEvent};
 use crate::proxy::ProxyManager;
-use env_logger;
+use crate::stream::HysResponse;
+use bytes::Bytes;
 use futures::stream::StreamExt;
+use lib_rusteria::proto::{HysteriaTCPResponse, HysteriaTCPResponseStatus};
 use log::{debug, error, info, warn};
 use quiche::h3;
 use std::collections::BTreeMap;
-use bytes::Bytes;
+use std::sync::Arc;
 use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::Sender;
 use tokio_quiche::listen;
 use tokio_quiche::metrics::DefaultMetrics;
 use tokio_quiche::quic::SimpleConnectionIdGenerator;
 use tokio_quiche::settings::ConnectionParams;
-use libRustiera::proto::{HysteriaTCPResponse, HysteriaTCPResponseStatus};
+use crate::commandline::parse_args;
 
-const HOSTNAME: &str = "0.0.0.0";
-const LISTEN_PORT: u16 = 8888;
-
-pub fn main() {
-    server();
-}
 #[tokio::main]
-async fn server() {
-    console_subscriber::init();
-    env_logger::init();
-    
-    let addr: String = format!("{}:{}", HOSTNAME, LISTEN_PORT);
-    let socket = tokio::net::UdpSocket::bind(addr).await.unwrap();
+pub async fn server() {
+    //console_subscriber::init();
+    let config = parse_args();
+    let socket = tokio::net::UdpSocket::bind(&config.addr).await.unwrap();
+    info!("listening on {}", config.addr);
     let mut quic_settings = tokio_quiche::settings::QuicSettings::default();
-    quic_settings.keylog_file= Some("/tmp/keylog.txt".to_string());
+    quic_settings.keylog_file = Some("/tmp/keylog.txt".to_string());
     let mut listeners = listen(
         [socket],
         ConnectionParams::new_server(
             quic_settings,
             tokio_quiche::settings::TlsCertificatePaths {
-                cert: "/tmp/cert/cert.pem",
-                private_key: "/tmp/cert/key.pem",
+                cert: &config.cert_path,
+                private_key: &config.key_path,
                 kind: tokio_quiche::settings::CertificateKind::X509,
             },
             Default::default(),
@@ -50,11 +46,12 @@ async fn server() {
         let (driver, controller) = HysDriver::new();
         conn.unwrap().start(driver);
         debug!("new connection");
-        tokio::spawn(handle_connection(controller, Handle::current()));
+        let auth_token = config.auth_token.clone();
+        tokio::spawn(handle_connection(controller, Handle::current(), auth_token));
     }
 }
-async fn handle_connection(mut controller: HysController, handle: Handle) {
-    let mut proxy_map: BTreeMap<u64, Sender<Bytes>> = BTreeMap::new();
+async fn handle_connection(mut controller: HysController, handle: Handle, auth_token: String) {
+    let proxy_map: Arc<Mutex<BTreeMap<u64, Sender<Bytes>>>> = Arc::new(Mutex::new(BTreeMap::new()));
     let mut is_verified: bool = false;
     while let Some(event) = controller.event_receiver_mut().recv().await {
         debug!("event received:{:?}", event);
@@ -66,7 +63,7 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
                 if !is_verified {
                     match h3_event {
                         h3::Event::Headers { list, .. } => {
-                            let (auth_res, response) = auth::auth(list);
+                            let (auth_res, response) = auth::auth(list, &auth_token);
                             is_verified = auth_res;
                             //ignore sending error for now
                             sender
@@ -94,34 +91,47 @@ async fn handle_connection(mut controller: HysController, handle: Handle) {
                     ProxyEvent::Request(url, sender) => {
                         info!("Received request for url: {}", url);
                         let (tx, rx) = tokio::sync::mpsc::channel(65535);
-                        proxy_map.insert(stream_id, tx);
+                        {
+                            let mut locked_map = proxy_map.lock().await;
+                            locked_map.insert(stream_id, tx);
+                        }
+
                         let proxy_response = HysteriaTCPResponse::new(
                             HysteriaTCPResponseStatus::Ok,
                             "Hello World!",
                             "padding",
-                        ).into_bytes();
+                        )
+                        .into_bytes();
                         sender
-                            .send(Bytes::from(proxy_response)).await.unwrap();
-                        let mut proxy_manager = ProxyManager::new(url, sender.clone(), rx );
+                            .send(HysResponse {
+                                bytes: Bytes::from(proxy_response),
+                                fin: false,
+                            })
+                            .await
+                            .unwrap();
+                        let mut proxy_manager = ProxyManager::new(url, sender.clone(), rx);
+
+                        let proxy_map_ref = Arc::clone(&proxy_map);
                         handle.spawn(async move {
+                            //keep a local copy of the stream id
                             proxy_manager.start().await;
+                            //cleanup
+                            let mut map = proxy_map_ref.lock().await;
+                            map.remove(&stream_id);
                         });
                     }
                     ProxyEvent::Payload(payload) => {
                         info!("Received proxy payload for stream id: {}", stream_id);
-                        if proxy_map.contains_key(&stream_id) {
-                          if let Err(e) =proxy_map
-                                .get_mut(&stream_id)
-                                .unwrap()
-                                .send(payload)
-                                .await{
-                                    error!("Failed to send payload to the proxy unit: {}", e);
-                                }
-                        }else{
+                        let mut map = proxy_map.lock().await;
+                        if let Some(sender) = map.get_mut(&stream_id) {
+                            if let Err(e) = sender.send(payload).await {
+                                error!("Failed to send payload to the proxy unit: {}", e);
+                            }
+                        } else {
                             error!("stream id: {} not registered with a target", stream_id);
                         }
                     }
-                }
+                };
             }
         }
     }

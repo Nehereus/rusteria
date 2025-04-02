@@ -1,7 +1,7 @@
 use log::{debug, error, info, warn};
-use quiche::h3::{Header, NameValue};
 use octets::Octets;
 use quiche::Error;
+use quiche::h3::{Header, NameValue};
 
 const MAX_ADDRESS_LENGTH: u64 = 253;
 pub struct AuthRequest<'a> {
@@ -51,12 +51,10 @@ impl<'a> AuthResponse<'a> {
 // [varint] Padding length
 // [bytes] Random padding
 pub struct HysteriaTcpRequest {
-    pub reqest_id: u64,
+    pub request_id: u64,
     //maximum possible length is 253 thus only reasonable int type is u8
-    url_len: u64,
     //potentially none resolved url
     pub url: String,
-    padding_len: u64,
     pub padding: String,
 }
 
@@ -67,29 +65,33 @@ impl HysteriaTcpRequest {
         let request_id = octet.get_varint().ok()?;
         let addr_len = octet.get_varint().ok()?;
         if addr_len == 0 || addr_len > MAX_ADDRESS_LENGTH {
-            error!("Failed to parse: the request has a url length of {}, which is invalid", addr_len);
+            error!(
+                "Failed to parse: the request has a url length of {}, which is invalid",
+                addr_len
+            );
             return None;
         }
         let url_bytes = octet.get_bytes(addr_len as usize).ok()?;
         let url = std::str::from_utf8(url_bytes.buf()).ok()?.to_string();
-        
+
         let padding_len = octet.get_varint().ok()?;
         let padding_bytes = octet.get_bytes(padding_len as usize).ok()?;
-        let padding =  std::str::from_utf8(padding_bytes.buf()).ok()?.to_string();
+        let padding = std::str::from_utf8(padding_bytes.buf()).ok()?.to_string();
         let remaining_bytes = bytes.len() - octet.off();
         info!(
             "Parsed TCP request: request_id={}, addr_len={}, url={}, padding_len={}, remaining_bytes={}",
             request_id, addr_len, url, padding_len, remaining_bytes
         );
         if remaining_bytes > 0 {
-            info!("remaining bytes in ascii: {}", String::from_utf8_lossy(&bytes[octet.off()..]));
+            info!(
+                "remaining bytes in ascii: {}",
+                String::from_utf8_lossy(&bytes[octet.off()..])
+            );
         }
         //print remaining bytes
         Some(Self {
-            reqest_id: request_id,
-            url_len: addr_len,
+            request_id,
             url,
-            padding_len,
             padding,
         })
     }
@@ -162,11 +164,16 @@ impl<'a> AuthRequest<'a> {
                     Err(e) => warn!("Invalid auth header: {}", e),
                 },
                 Ok("hysteria-cc-rx") => {
-                    let rx_str = std::str::from_utf8(header.value()).expect("failed to read client rx");
+                    let rx_str =
+                        std::str::from_utf8(header.value()).expect("failed to read client rx");
                     if rx_str == "auto" {
                         client_rx = Some(0);
                     } else {
-                        client_rx = Some(rx_str.parse::<u64>().expect("failed to parse client rx to u64"));
+                        client_rx = Some(
+                            rx_str
+                                .parse::<u64>()
+                                .expect("failed to parse client rx to u64"),
+                        );
                     }
                 }
 

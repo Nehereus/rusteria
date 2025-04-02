@@ -1,12 +1,12 @@
 [package]
-name = "libRustiera"
+name = "lib_rusteria"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 quiche = "*"
 log = "*"
-env_logger = "*"
-byteorder = "*"
 octets = "*"
 
+[lib]
+path = "src/lib.rs"

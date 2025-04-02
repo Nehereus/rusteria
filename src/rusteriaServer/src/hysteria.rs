@@ -1,8 +1,11 @@
-use crate::stream::{ReceivedH3Stream, ReceivedQuicStream, StreamReady, WaitForH3Stream, WaitForQuicStream, WaitForStream};
-use bytes::{Buf, Bytes, BytesMut};
+use crate::stream::{
+    HysResponse, ReceivedH3Stream, ReceivedQuicStream, StreamReady, WaitForH3Stream,
+    WaitForQuicStream, WaitForStream,
+};
+use bytes::{ Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use libRustiera::proto::HysteriaTcpRequest;
+use lib_rusteria::proto::HysteriaTcpRequest;
 use log::{debug, error, info, trace, warn};
 use quiche::{Connection, Shutdown};
 use std::collections::BTreeMap;
@@ -13,6 +16,8 @@ use tokio_quiche::buffer_pool::PooledBuf;
 use tokio_quiche::http3::driver::OutboundFrame;
 use tokio_quiche::quic::{HandshakeInfo, QuicheConnection};
 use tokio_quiche::{ApplicationOverQuic, QuicResult};
+
+const MAX_BUF_SIZE: usize = 65535 * 5; //64kb*5
 
 #[derive(Debug)]
 pub struct H3Response {
@@ -27,7 +32,7 @@ pub enum HysEvent {
 #[derive(Debug)]
 pub enum ProxyEvent {
     //url
-    Request(String, mpsc::Sender<Bytes>),
+    Request(String, mpsc::Sender<HysResponse>),
     Payload(Bytes),
 }
 
@@ -59,13 +64,15 @@ struct H3Context {
 struct QuicContext {
     //TODO undetermined implementation
     queued_bytes: BytesMut,
+    fin: bool,
+    read_fin: bool,
 }
 impl HysDriver {
     pub fn new() -> (Self, HysController) {
         let mut h3config = quiche::h3::Config::new().unwrap();
         h3config.set_qpack_max_table_capacity(64);
         h3config.set_qpack_blocked_streams(64);
-        
+
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
         (
             Self {
@@ -93,7 +100,7 @@ impl HysDriver {
     ) -> Result<(), quiche::h3::Error> {
         match ready {
             StreamReady::H3Stream(r) => self.h3_ready(qconn, r),
-            StreamReady::QuicStream(r) => self.quic_ready(qconn,r),
+            StreamReady::QuicStream(r) => self.quic_ready(qconn, r),
         }
     }
     fn h3_ready(
@@ -127,20 +134,27 @@ impl HysDriver {
             chan,
             response,
         } = quic_ready;
-        //rearm the waiting_streams
-        if !chan.is_closed(){
-            self.waiting_streams.push(WaitForStream::QuicStream(WaitForQuicStream {
-                stream_id,
-                chan: Some(chan),
-            }));
-        }
         match self.quic_context_map.get_mut(&stream_id) {
             None => Ok(()),
             Some(stream) => {
                 // Get the response data before processing
                 if let Some(response) = response {
-                    info!("{} quic stream {} read: {}", qconn.trace_id(), stream_id, response.len());
-                    stream.queued_bytes.extend_from_slice(&response);
+                    //rearm the waiting_streams if not finished and
+                    if !(chan.is_closed() && response.fin) {
+                        self.waiting_streams
+                            .push(WaitForStream::QuicStream(WaitForQuicStream {
+                                stream_id,
+                                chan: Some(chan),
+                            }));
+                    }
+                    info!(
+                        "{} quic stream {} read: {}",
+                        qconn.trace_id(),
+                        stream_id,
+                        response.bytes.len()
+                    );
+                    stream.queued_bytes.extend_from_slice(&response.bytes);
+                    stream.fin |= response.fin;
                 }
                 Ok(())
             }
@@ -212,72 +226,94 @@ impl HysDriver {
     // should send one of the HysEvent to the receiver
     fn handle_quic_request(&mut self, qconn: &mut Connection) -> QuicResult<()> {
         for stream_id in qconn.readable() {
-            let mut read_buf: [u8; 65535] = [0; 65535];
             let mut offset = 0;
             while qconn.stream_readable(stream_id) {
-                let (read, fin) = qconn.stream_recv(stream_id, &mut read_buf[offset..])?;
-                debug!("{} quic stream {} read: {}", qconn.trace_id(), stream_id, read);
+                //Fin signal will be handled at the end
+                let (read,_) = qconn.stream_recv(stream_id, &mut self.buffer)?;
+                debug!(
+                    "{} quic stream {} read: {}",
+                    qconn.trace_id(),
+                    stream_id,
+                    read
+                );
                 offset += read;
             }
-            let (tx, rx) = mpsc::channel(65535);
-            let mut event: Option<HysEvent> = None;
-            //determine if this is a new proxy request or payload of an existing request
-            // if let Some(req) =HysteriaTcpRequest::from_bytes(&read_buf[..offset]) {
-            //         if self.quic_context_map.get_mut(&stream_id).is_none() {
-            if self.quic_context_map.get_mut(&stream_id).is_none(){
-               if let Some(req) =  HysteriaTcpRequest::from_bytes(&read_buf[..offset]){
-                   let _ = event.insert(HysEvent::QuicEvent(
-                       stream_id,
-                       ProxyEvent::Request(req.url, tx),
-                   ));
-                   self.quic_context_map.insert(
-                       stream_id,
-                       QuicContext {
-                           queued_bytes: BytesMut::with_capacity(65535),
-                       },
-                   ); 
-               }else{
-                   error!("client is sending invalid initial proxy request");
-               }
-            }else {
-                if offset == 0 {
-                    info!(
-                        "Client signifies the end of the stream, stream id: {}",
-                        stream_id
-                    );
-                    //this is highly coupling, which handles the event locally
-                    //but since the only use of a 0 offset receive event by definition
-                    //is the end of the stream, we just handle it here
-                    let shutdown_result = qconn.stream_shutdown(stream_id, Shutdown::Read, 0);
-                    //TODO refactor. coding style is awakward
-                    match shutdown_result {
-                        Ok(_) | Err(quiche::Error::Done) => {
-                            info!("{} stream {} was shutdown gracefully", qconn.trace_id(), stream_id);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "{} stream {} shutdown error: {}",
-                                qconn.trace_id(),
-                                stream_id,
-                                e
-                            );
-                        }
+            if offset == 0 {
+                info!(
+                    "Client signifies the end of the stream, stream id: {}",
+                    stream_id
+                );
+                //this is highly coupling, which handles the event locally
+                //but since the only use of a 0 offset receive event by definition
+                //is the end of the stream, we just handle it here
+                let shutdown_result = qconn.stream_shutdown(stream_id, Shutdown::Read, 0);
+                //TODO refactor. coding style is awakward
+                match shutdown_result {
+                    Ok(_) | Err(quiche::Error::Done) => {
+                        info!(
+                            "{} stream {} was shutdown gracefully",
+                            qconn.trace_id(),
+                            stream_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "{} stream {} shutdown error: {}",
+                            qconn.trace_id(),
+                            stream_id,
+                            e
+                        );
+                    }
+                }
+            } else {
+                let (tx, rx) = mpsc::channel(MAX_BUF_SIZE);
+                let mut event: Option<HysEvent> = None;
+                let mut read_data = std::mem::replace(&mut self.buffer, BufFactory::get_max_buf());
+                read_data.truncate(offset);
+                //determine if this is a new proxy request or payload of an existing request
+                // if let Some(req) =HysteriaTcpRequest::from_bytes(&read_buf[..offset]) {
+                //         if self.quic_context_map.get_mut(&stream_id).is_none() {
+                if self.quic_context_map.get_mut(&stream_id).is_none() {
+                    if let Some(req) = HysteriaTcpRequest::from_bytes(&**read_data) {
+                        let _ = event.insert(HysEvent::QuicEvent(
+                            stream_id,
+                            ProxyEvent::Request(req.url, tx),
+                        ));
+                        self.quic_context_map.insert(
+                            stream_id,
+                            QuicContext {
+                                queued_bytes: BytesMut::with_capacity(MAX_BUF_SIZE),
+                                fin: false,
+                                read_fin: false,
+                            },
+                        );
+                    } else {
+                        error!(
+                            "client is sending invalid initial proxy request on stream id: {}",
+                            stream_id
+                        );
                     }
                 } else {
-                    let inbound_bytes = Bytes::copy_from_slice(&read_buf[..offset]);
+                    //TODO Copying
+                    let inbound_bytes = Bytes::copy_from_slice(&read_data);
                     let _ = event.insert(HysEvent::QuicEvent(
                         stream_id,
                         ProxyEvent::Payload(inbound_bytes),
                     ));
                 }
-            }
-            if event.is_some() {
-                trace!("{} sending event to the handler: {:?}", qconn.trace_id(), event);
-                if let Err(e) = self.event_sender
-                    .send(event.unwrap()){
-                    //TODO receiver closed 
-                    error!("Failed to send event to the handler: {}", e);
+                trace!(
+                    "{} sending event to the handler: {:?}",
+                    qconn.trace_id(),
+                    event
+                );
+                if event.is_some() {
+                    //TODO: investigate why client ignores the fin signal
+                    if let Err(e) = self.event_sender.send(event.unwrap()) {
+                        //TODO receiver closed
+                        error!("Failed to send event to the handler: {}", e);
+                    }
                 }
+
                 self.waiting_streams
                     .push(WaitForStream::QuicStream(WaitForQuicStream {
                         stream_id,
@@ -290,7 +326,7 @@ impl HysDriver {
     fn handle_h3_request(&mut self, qconn: &mut Connection) -> QuicResult<()> {
         match self.h3conn_as_mut().poll(qconn) {
             Ok((stream_id, event)) => {
-                let (tx, rx) = mpsc::channel(65535);
+                let (tx, rx) = mpsc::channel(MAX_BUF_SIZE);
 
                 self.h3_context_map.insert(
                     stream_id,
@@ -378,31 +414,68 @@ impl ApplicationOverQuic for HysDriver {
             if !self.is_verified {
                 if let Some(context) = self.h3_context_map.get_mut(&stream_id) {
                     if !context.queued_frames.is_empty() {
-                        debug!("Writing {} h3 frame(s) to the client", context.queued_frames.len());
+                        debug!(
+                            "Writing {} h3 frame(s) to the client",
+                            context.queued_frames.len()
+                        );
                         let mut responses_to_process = Vec::new();
                         while let Some(response) = context.queued_frames.pop() {
                             responses_to_process.push(response);
                         }
                         for response in responses_to_process {
-                            self.handle_h3_response(qconn, stream_id, &response).expect("TODO: panic message");
+                            self.handle_h3_response(qconn, stream_id, &response)
+                                .expect("TODO: panic message");
                         }
                     }
                 } else {
                     //TODO: proper logging
                     trace!("new unverified stream id: {}", stream_id);
                 }
-            }else{
-                if let Some(context) = self.quic_context_map.get_mut(&stream_id){
-                    if !context.queued_bytes.is_empty(){
-                        debug!("writing len {} bytes quic traffic to the client", context.queued_bytes.len());
-                        trace!("bytes content in ascii: {}", String::from_utf8_lossy(&context.queued_bytes));
-                        let bytes_to_send = context.queued_bytes.clone();
-                        let sent = qconn.stream_send(stream_id, &bytes_to_send, false)?;
-                        if sent == bytes_to_send.len() {
-                            context.queued_bytes.clear();
-                        } else {
-                            context.queued_bytes.advance(sent);
+            } else {
+                if let Some(context) = self.quic_context_map.get_mut(&stream_id) {
+                    if !context.queued_bytes.is_empty() {
+                        debug!(
+                            "writing len {} bytes quic traffic to the client",
+                            context.queued_bytes.len()
+                        );
+                        trace!(
+                            "bytes content in ascii: {}",
+                            String::from_utf8_lossy(&context.queued_bytes)
+                        );
+                        if !context.read_fin && context.fin {
+                            //discard all remaining info in the channel
+                            if let Err(e) = qconn.stream_shutdown(stream_id, Shutdown::Read, 0) {
+                                trace!(
+                                    "{} stream {} shutdown error: {}",
+                                    qconn.trace_id(),
+                                    stream_id,
+                                    e
+                                );
+                            }
                         }
+                        let sent = qconn.stream_send(stream_id, &*context.queued_bytes, false)?;
+                        context.queued_bytes = context.queued_bytes.split_off(sent);
+                        context.queued_bytes.reserve(65535);
+                    }
+                    if context.fin && context.queued_bytes.is_empty() {
+                        if let Err(e) = qconn.stream_shutdown(stream_id, Shutdown::Write, 0) {
+                            error!(
+                                "{} stream {} shutdown error: {}",
+                                qconn.trace_id(),
+                                stream_id,
+                                e
+                            );
+                        }
+                        if let Err(e) = qconn.stream_send(stream_id, b"", true) {
+                            error!(
+                                "{} stream {} sending fi signal to the client: {}",
+                                qconn.trace_id(),
+                                stream_id,
+                                e
+                            );
+                        }
+                        self.quic_context_map.remove(&stream_id);
+                        info!("{} stream {} fin", qconn.trace_id(), stream_id);
                     }
                 }
             }
