@@ -1,0 +1,81 @@
+name: Rust Build and Release
+
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_BIN: rusteriaServer
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install latest stable Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Build rusteriaServer
+        run: cargo build --release --package rusteriaServer --bin rusteriaServer
+        
+      - name: Run tests
+        run: cargo test --package rusteriaServer --verbose
+        
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: rusteriaServer-linux
+          path: target/release/rusteriaServer
+          
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: rusteriaServer-linux
+          path: ./
+          
+      - name: Make binary executable
+        run: chmod +x ./rusteriaServer
+        
+      - name: Create release archive
+        run: |
+          tar -czf rusteriaServer-linux-x86_64.tar.gz rusteriaServer
+          sha256sum rusteriaServer-linux-x86_64.tar.gz > rusteriaServer-linux-x86_64.tar.gz.sha256
+          
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            rusteriaServer-linux-x86_64.tar.gz
+            rusteriaServer-linux-x86_64.tar.gz.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true
