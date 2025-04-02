@@ -41,7 +41,7 @@ jobs:
         run: cargo test --package rusteriaServer --verbose
         
       - name: Upload build artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: rusteriaServer-linux
           path: target/release/rusteriaServer
