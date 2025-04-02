@@ -8,8 +8,8 @@ The package has two components. ```libRusteria``` is the implementation of the H
 - [x] HTTP3 masquerading server
 - [x] Authentication
 - [x] TCP proxy
-- [] UDP proxy
-- [] Congestion control (currently using tokio-quiche's default)
+- [ ] UDP proxy
+- [ ] Congestion control (currently using tokio-quiche's default)
 
 ## How things go
 The program is a (long) weekend hack, which means it's not meant to be a daily driver proxy server. However, thanks to Rust's memory efficiency, the memory footprint of the app should be as small as ~30MB. In terms of performance, it's frankly underoptimized. In LAN test experiments, the peak throughput is ~200MB/s.
