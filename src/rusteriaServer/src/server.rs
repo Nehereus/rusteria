@@ -60,16 +60,17 @@ async fn handle_connection(mut controller: HysController, handle: Handle, auth_t
         match event {
             //handle H3 event locally because ideally all auth event should be one shot
             HysEvent::H3Event(stream_id, h3_event, sender) => {
-                if !is_verified {
+                if is_verified { warn!("Verified user is sending h3 request again");}
                     match h3_event {
                         h3::Event::Headers { list, .. } => {
                             let (auth_res, response) = auth::auth(list, &auth_token);
                             is_verified = auth_res;
                             //ignore sending error for now
-                            sender
+                            if let Err(e) = sender
                                 .send(H3Response { auth_res, response })
-                                .await
-                                .unwrap();
+                                .await {
+                                info!("The quic connection was closed before the h3 response can be sent");
+                            }
                         }
                         h3::Event::Finished => {
                             //self.h3_outbound_map.remove(&stream_id);
@@ -80,11 +81,7 @@ async fn handle_connection(mut controller: HysController, handle: Handle, auth_t
                             info!("other h3 events:{:?}", other);
                         }
                     }
-                } else {
-                    warn!("Verified user is sending h3 request again");
-                }
                 //TODO: maybe use oneshot channel
-                drop(sender);
             }
             HysEvent::QuicEvent(stream_id, proxy_event) => {
                 match proxy_event {
@@ -98,7 +95,7 @@ async fn handle_connection(mut controller: HysController, handle: Handle, auth_t
 
                         let proxy_response = HysteriaTCPResponse::new(
                             HysteriaTCPResponseStatus::Ok,
-                            "Hello World!",
+                            "Hello, world!",
                             "padding",
                         )
                         .into_bytes();

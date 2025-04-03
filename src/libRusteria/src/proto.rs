@@ -56,11 +56,13 @@ pub struct HysteriaTcpRequest {
     //potentially none resolved url
     pub url: String,
     pub padding: String,
+    //the pos of the last byte in the input slice
+    pub offset: usize,
 }
 
 //TODO error handling when you have time
 impl HysteriaTcpRequest {
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub fn from_bytes(bytes: &[u8]) -> Option< Self> {
         let mut octet = Octets::with_slice(bytes);
         let request_id = octet.get_varint().ok()?;
         let addr_len = octet.get_varint().ok()?;
@@ -77,22 +79,17 @@ impl HysteriaTcpRequest {
         let padding_len = octet.get_varint().ok()?;
         let padding_bytes = octet.get_bytes(padding_len as usize).ok()?;
         let padding = std::str::from_utf8(padding_bytes.buf()).ok()?.to_string();
-        let remaining_bytes = bytes.len() - octet.off();
+        let offset=octet.off();
         info!(
             "Parsed TCP request: request_id={}, addr_len={}, url={}, padding_len={}, remaining_bytes={}",
-            request_id, addr_len, url, padding_len, remaining_bytes
+            request_id, addr_len, url, padding_len, octet.len()-octet.off()
         );
-        if remaining_bytes > 0 {
-            info!(
-                "remaining bytes in ascii: {}",
-                String::from_utf8_lossy(&bytes[octet.off()..])
-            );
-        }
-        //print remaining bytes
+
         Some(Self {
             request_id,
             url,
             padding,
+            offset,
         })
     }
 }
