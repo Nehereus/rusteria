@@ -16,6 +16,7 @@ use tokio_quiche::buffer_pool::PooledBuf;
 use tokio_quiche::http3::driver::OutboundFrame;
 use tokio_quiche::quic::{HandshakeInfo, QuicheConnection};
 use tokio_quiche::{ApplicationOverQuic, QuicResult};
+use tokio_quiche::metrics::Metrics;
 
 const MAX_BUF_SIZE: usize = 65535 * 5; //64kb*5
 
@@ -118,6 +119,14 @@ impl HysDriver {
             Some(stream) => {
                 // Get the response data before processing
                 if let Some(response) = response {
+                    //if the verification attempt fails, rearm the receiver
+                    // if !response.auth_res{
+                    //         self.waiting_streams
+                    //             .push(WaitForStream::H3Stream(WaitForH3Stream {
+                    //                 stream_id,
+                    //                 chan: Some(chan),
+                    //             }));
+                    // }
                     stream.queued_frames.push(response);
                 }
                 Ok(())
@@ -173,14 +182,15 @@ impl HysDriver {
         for frame in responses.response.iter() {
             sending_results.push(match frame {
                 OutboundFrame::Headers(h) => {
-                    debug!("{} send headers", qconn.trace_id());
+                    
                     if self
                         .h3conn_as_mut()
-                        .send_response(qconn, stream_id, h.as_ref(), false)
+                        .send_response(qconn, stream_id, h.as_ref(),responses.auth_res)
                         .is_err()
                     {
                         Some(OutboundFrame::Headers((*h.clone()).to_owned()))
                     } else {
+                        debug!("{} send headers", qconn.trace_id());
                         None
                     }
                 }
@@ -287,14 +297,16 @@ impl HysDriver {
                                 read_fin: false,
                             },
                         );
+                        let _ = read_data.split_at(offset);
                     } else {
                         error!(
-                            "client is sending invalid initial proxy request on stream id: {}",
+                            "client is sending invalid initial proxy request on stream {}",
                             stream_id
                         );
                     }
-                } else {
-                    //TODO Copying
+                }
+                else {
+                    //have to clone
                     let inbound_bytes = Bytes::copy_from_slice(&read_data);
                     let _ = event.insert(HysEvent::QuicEvent(
                         stream_id,
@@ -431,9 +443,9 @@ impl ApplicationOverQuic for HysDriver {
                     //TODO: proper logging
                     trace!("new unverified stream id: {}", stream_id);
                 }
-            } else {
+            } 
                 if let Some(context) = self.quic_context_map.get_mut(&stream_id) {
-                    if !context.queued_bytes.is_empty() {
+                    // if !context.queued_bytes.is_empty() {
                         debug!(
                             "writing len {} bytes quic traffic to the client",
                             context.queued_bytes.len()
@@ -456,7 +468,7 @@ impl ApplicationOverQuic for HysDriver {
                         let sent = qconn.stream_send(stream_id, &*context.queued_bytes, false)?;
                         context.queued_bytes = context.queued_bytes.split_off(sent);
                         context.queued_bytes.reserve(65535);
-                    }
+                    // }
                     if context.fin && context.queued_bytes.is_empty() {
                         if let Err(e) = qconn.stream_shutdown(stream_id, Shutdown::Write, 0) {
                             error!(
@@ -477,9 +489,20 @@ impl ApplicationOverQuic for HysDriver {
                         self.quic_context_map.remove(&stream_id);
                         info!("{} stream {} fin", qconn.trace_id(), stream_id);
                     }
-                }
+                // }
             }
         }
         Ok(())
+    }
+
+    fn on_conn_close<M: Metrics>(
+        &mut self,
+        qconn: &mut QuicheConnection,
+        metrics: &M,
+        connection_result: &QuicResult<()>,
+    ){
+        self.process_writes(qconn).unwrap();
+        
+        warn!("{}: quic connection closed", qconn.trace_id());
     }
 }
